@@ -1,0 +1,6 @@
+@ATC.DashboardApi_HostAddress = http://localhost:5279
+
+GET {{ATC.DashboardApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

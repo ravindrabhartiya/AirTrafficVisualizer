@@ -1,0 +1,12 @@
+C:\ATC\src\ATC.Shared\bin\Debug\net8.0\ATC.Shared.deps.json
+C:\ATC\src\ATC.Shared\bin\Debug\net8.0\ATC.Shared.dll
+C:\ATC\src\ATC.Shared\bin\Debug\net8.0\ATC.Shared.pdb
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ATC.Shared.csproj.AssemblyReference.cache
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ATC.Shared.GeneratedMSBuildEditorConfig.editorconfig
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ATC.Shared.AssemblyInfoInputs.cache
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ATC.Shared.AssemblyInfo.cs
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ATC.Shared.csproj.CoreCompileInputs.cache
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ATC.Shared.dll
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\refint\ATC.Shared.dll
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ATC.Shared.pdb
+C:\ATC\src\ATC.Shared\obj\Debug\net8.0\ref\ATC.Shared.dll

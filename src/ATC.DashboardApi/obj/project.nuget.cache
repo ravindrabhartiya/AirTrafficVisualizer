@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "dgSpecHash": "229mtn+y6vY=",
+  "success": true,
+  "projectFilePath": "C:\\ATC\\src\\ATC.DashboardApi\\ATC.DashboardApi.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\ravibh\\.nuget\\packages\\microsoft.extensions.dependencyinjection.abstractions\\8.0.0\\microsoft.extensions.dependencyinjection.abstractions.8.0.0.nupkg.sha512",
+    "C:\\Users\\ravibh\\.nuget\\packages\\microsoft.extensions.logging.abstractions\\8.0.0\\microsoft.extensions.logging.abstractions.8.0.0.nupkg.sha512",
+    "C:\\Users\\ravibh\\.nuget\\packages\\pipelines.sockets.unofficial\\2.2.8\\pipelines.sockets.unofficial.2.2.8.nupkg.sha512",
+    "C:\\Users\\ravibh\\.nuget\\packages\\stackexchange.redis\\2.12.4\\stackexchange.redis.2.12.4.nupkg.sha512",
+    "C:\\Users\\ravibh\\.nuget\\packages\\system.io.hashing\\10.0.2\\system.io.hashing.10.0.2.nupkg.sha512",
+    "C:\\Users\\ravibh\\.nuget\\packages\\system.io.pipelines\\10.0.5\\system.io.pipelines.10.0.5.nupkg.sha512",
+    "C:\\Users\\ravibh\\.nuget\\packages\\system.text.encodings.web\\10.0.5\\system.text.encodings.web.10.0.5.nupkg.sha512",
+    "C:\\Users\\ravibh\\.nuget\\packages\\system.text.json\\10.0.5\\system.text.json.10.0.5.nupkg.sha512"
+  ],
+  "logs": []
+}
