@@ -17,11 +17,17 @@ public sealed class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private DateTime _lastConsumeUtc = DateTime.MinValue;
 
+    /// <summary>Queue of flight updates waiting to be flushed to SignalR.</summary>
+    private readonly ConcurrentQueue<FlightPosition> _signalRQueue = new();
+
     /// <summary>Max age of a telemetry message before it is discarded.</summary>
     private static readonly TimeSpan StaleThreshold = TimeSpan.FromMinutes(2);
 
     /// <summary>Number of parallel consumer threads (one per Kafka partition max).</summary>
     private const int ConsumerCount = 3;
+
+    /// <summary>Max items sent in a single SignalR batch message.</summary>
+    internal const int MaxBatchSize = 200;
 
     public Worker(
         ConsumerConfig consumerConfig,
@@ -52,8 +58,9 @@ public sealed class Worker : BackgroundService
 
         await ConnectToSignalRAsync(hubConnection, stoppingToken);
 
-        // Run stale geo-entry cleanup and parallel Kafka consumers
+        // Run stale geo-entry cleanup, SignalR batch flush, and parallel Kafka consumers
         var cleanupTask = CleanupStaleGeoEntriesAsync(stoppingToken);
+        var flushTask = FlushSignalRBatchesAsync(hubConnection, stoppingToken);
 
         var consumeTasks = new Task[ConsumerCount];
         for (int i = 0; i < ConsumerCount; i++)
@@ -63,7 +70,7 @@ public sealed class Worker : BackgroundService
         }
         _logger.LogInformation("Launched {Count} parallel Kafka consumers", ConsumerCount);
 
-        await Task.WhenAll(consumeTasks.Append(cleanupTask));
+        await Task.WhenAll(consumeTasks.Append(cleanupTask).Append(flushTask));
     }
 
     private async Task WarmRedisCacheAsync()
@@ -173,6 +180,37 @@ public sealed class Worker : BackgroundService
         }
     }
 
+    /// <summary>
+    /// Drains the SignalR queue every 500 ms and sends accumulated flight updates
+    /// as a single batch message, reducing per-message SignalR overhead.
+    /// </summary>
+    private async Task FlushSignalRBatchesAsync(HubConnection hub, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                if (hub.State == HubConnectionState.Connected && !_signalRQueue.IsEmpty)
+                {
+                    var batch = new List<FlightPosition>(MaxBatchSize);
+                    while (batch.Count < MaxBatchSize && _signalRQueue.TryDequeue(out var pos))
+                        batch.Add(pos);
+
+                    if (batch.Count > 0)
+                    {
+                        await hub.InvokeAsync("BroadcastFlightBatch", batch, ct);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "SignalR batch flush failed");
+            }
+
+            await Task.Delay(500, ct);
+        }
+    }
+
     private void ConsumeLoop(HubConnection hubConnection, int consumerId, CancellationToken ct)
     {
         using var consumer = new ConsumerBuilder<string, string>(_consumerConfig).Build();
@@ -211,18 +249,8 @@ public sealed class Worker : BackgroundService
                     _lastConsumeUtc = DateTime.UtcNow;
                     var (position, _) = processor.ProcessAsync(flight).GetAwaiter().GetResult();
 
-                    // Push update to SignalR hub
-                    if (hubConnection.State == HubConnectionState.Connected)
-                    {
-                        try
-                        {
-                            hubConnection.InvokeAsync("BroadcastFlightUpdate", position, ct).GetAwaiter().GetResult();
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Consumer-{Id}: SignalR send failed for {Icao}", consumerId, flight.Icao24);
-                        }
-                    }
+                    // Enqueue for batched SignalR delivery (non-blocking)
+                    _signalRQueue.Enqueue(position);
                 }
                 catch (JsonException ex)
                 {

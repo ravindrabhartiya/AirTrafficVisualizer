@@ -2,6 +2,7 @@ using ATC.DashboardApi;
 using ATC.Shared;
 using Confluent.Kafka;
 using Confluent.Kafka.Admin;
+using Microsoft.AspNetCore.ResponseCompression;
 using StackExchange.Redis;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -10,11 +11,22 @@ var kafkaBootstrap = builder.Configuration.GetValue("Kafka:BootstrapServers", "l
 var redisConnection = builder.Configuration.GetValue("Redis:ConnectionString", "localhost:6379")!;
 var dbPath = builder.Configuration.GetValue("Sqlite:DbPath", "flights.db")!;
 
-builder.Services.AddSingleton<IConnectionMultiplexer>(ConnectionMultiplexer.Connect(redisConnection));
+var redisOptions = ConfigurationOptions.Parse(redisConnection);
+redisOptions.AllowAdmin = true;
+builder.Services.AddSingleton<IConnectionMultiplexer>(ConnectionMultiplexer.Connect(redisOptions));
 builder.Services.AddSingleton<IFlightSnapshotStore>(new SqliteFlightSnapshotStore(dbPath));
 builder.Services.AddSingleton(new AdminClientConfig { BootstrapServers = kafkaBootstrap });
 
 builder.Services.AddSignalR();
+
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+    options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();
+    options.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(
+        new[] { "application/json" });
+});
 
 builder.Services.AddCors(options =>
 {
@@ -29,52 +41,65 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
+app.UseResponseCompression();
 app.UseCors();
 app.UseStaticFiles();
 
 app.MapHub<FlightHub>("/flighthub");
 
-app.MapGet("/radar", async (IConnectionMultiplexer redis, IFlightSnapshotStore snapshotStore) =>
+app.MapGet("/radar", async (IConnectionMultiplexer redis, IFlightSnapshotStore snapshotStore,
+    double? swLat, double? swLng, double? neLat, double? neLng) =>
 {
     var db = redis.GetDatabase();
 
-    // The geo key is a sorted set under the hood — get all members
-    var members = await db.SortedSetRangeByRankAsync(Constants.RedisGeoKey);
+    // ── Determine which ICAO24 members to fetch ──
+    RedisValue[] members;
+    var bbox = GeoHelpers.ParseBbox(swLat, swLng, neLat, neLng);
+
+    if (bbox is not null)
+    {
+        // Viewport-filtered: only return flights visible on the map
+        var results = await db.GeoSearchAsync(
+            Constants.RedisGeoKey,
+            bbox.CenterLon, bbox.CenterLat,
+            new GeoSearchBox(bbox.WidthKm, bbox.HeightKm, GeoUnit.Kilometers));
+        members = results.Select(r => r.Member).ToArray();
+    }
+    else
+    {
+        // No bbox — return all (backward compatible)
+        members = await db.SortedSetRangeByRankAsync(Constants.RedisGeoKey);
+    }
 
     if (members is null || members.Length == 0)
     {
-        // Cold start: fall back to SQLite snapshot (use generous window
-        // so data survives prolonged service stalls)
+        // Cold start: fall back to SQLite snapshot
         var snapshot = await snapshotStore.LoadAllAsync(TimeSpan.FromMinutes(30));
         return Results.Ok(snapshot);
     }
 
-    var flights = new List<FlightPosition>();
-
+    // ── Pipelined Redis lookups (one round-trip for all hashes) ──
+    var batch = db.CreateBatch();
+    var tasks = new Dictionary<string, Task<HashEntry[]>>(members.Length);
     foreach (var member in members)
     {
         var icao = member.ToString();
-        var hash = await db.HashGetAllAsync($"flight:{icao}");
+        tasks[icao] = batch.HashGetAllAsync($"flight:{icao}");
+    }
+    batch.Execute();
+    await Task.WhenAll(tasks.Values);
+
+    var flights = new List<FlightPosition>(tasks.Count);
+    foreach (var (icao, task) in tasks)
+    {
+        var hash = task.Result;
         if (hash.Length == 0) continue;
 
         var dict = hash.ToDictionary(
             h => h.Name.ToString(),
             h => h.Value.ToString());
-
-        flights.Add(new FlightPosition
-        {
-            Icao24 = icao,
-            Callsign = dict.GetValueOrDefault("callsign", ""),
-            Latitude = double.TryParse(dict.GetValueOrDefault("latitude"), out var lat) ? lat : 0,
-            Longitude = double.TryParse(dict.GetValueOrDefault("longitude"), out var lon) ? lon : 0,
-            Altitude = double.TryParse(dict.GetValueOrDefault("altitude"), out var alt) ? alt : 0,
-            Velocity = double.TryParse(dict.GetValueOrDefault("velocity"), out var vel) ? vel : 0,
-            TrueTrack = double.TryParse(dict.GetValueOrDefault("trueTrack"), out var trk) ? trk : 0,
-            VerticalRate = double.TryParse(dict.GetValueOrDefault("verticalRate"), out var vr) ? vr : 0,
-            OnGround = dict.GetValueOrDefault("onGround") == "1",
-            OriginCountry = dict.GetValueOrDefault("originCountry", ""),
-            LastUpdate = long.TryParse(dict.GetValueOrDefault("lastUpdate"), out var upd) ? upd : 0
-        });
+        var fp = GeoHelpers.ParseFlightFromDict(icao, dict);
+        if (fp is not null) flights.Add(fp);
     }
 
     return Results.Ok(flights);

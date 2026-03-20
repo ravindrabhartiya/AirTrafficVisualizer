@@ -13,11 +13,21 @@ public sealed class FlightHub : Hub
     }
 
     /// <summary>
-    /// Called by the Tracking Engine to broadcast a flight position update to all dashboard clients.
+    /// Called by the Tracking Engine to broadcast a single flight position update.
+    /// Kept for backward compatibility; prefer <see cref="BroadcastFlightBatch"/>.
     /// </summary>
     public async Task BroadcastFlightUpdate(FlightPosition position)
     {
         await Clients.All.SendAsync("FlightUpdated", position);
+    }
+
+    /// <summary>
+    /// Called by the Tracking Engine to broadcast a batch of flight position updates
+    /// in a single SignalR message, reducing per-message overhead.
+    /// </summary>
+    public async Task BroadcastFlightBatch(IEnumerable<FlightPosition> positions)
+    {
+        await Clients.All.SendAsync("FlightBatchUpdated", positions);
     }
 
     public override Task OnConnectedAsync()

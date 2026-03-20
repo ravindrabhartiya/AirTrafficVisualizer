@@ -94,6 +94,24 @@
         const STALE_MS = 300_000;         // remove live-tracked after 5 min
         const STALE_ESTIMATED_MS = 1_800_000; // keep estimated (oceanic) up to 30 min
 
+        // Normalise compact-JSON wire format into readable keys used by all UI code.
+        // Accepts both compact (cs, lat, lon, …) and legacy (callsign, latitude, …) shapes.
+        function normalise(f) {
+            return {
+                icao24:        f.icao24,
+                callsign:      f.cs      ?? f.callsign      ?? "",
+                latitude:      f.lat     ?? f.latitude       ?? 0,
+                longitude:     f.lon     ?? f.longitude      ?? 0,
+                altitude:      f.alt     ?? f.altitude       ?? 0,
+                velocity:      f.vel     ?? f.velocity       ?? 0,
+                trueTrack:     f.trk     ?? f.trueTrack      ?? 0,
+                verticalRate:  f.vr      ?? f.verticalRate   ?? 0,
+                onGround:      f.gnd     ?? f.onGround       ?? false,
+                originCountry: f.cty     ?? f.originCountry  ?? "",
+                lastUpdate:    f.ts      ?? f.lastUpdate     ?? 0
+            };
+        }
+
         function createPlaneIcon(heading, isWarning, isEstimated) {
             const color = isWarning ? "#ef4444" : isEstimated ? "#64748b" : "#38bdf8";
             const opacity = isEstimated ? "0.55" : "0.95";
@@ -262,7 +280,8 @@
             return `<span class="label">Route:</span> <span style="color:#94a3b8;">Unknown</span>`;
         }
 
-        function upsertMarker(flight, isEstimated = false) {
+        function upsertMarker(raw, isEstimated = false) {
+            const flight = normalise(raw);
             const key = flight.icao24;
             const latlng = [flight.latitude, flight.longitude];
             const icon = createPlaneIcon(flight.trueTrack || 0, false, isEstimated);
@@ -339,7 +358,14 @@
         // ─── Initial Load from REST API ──────────────────────────
         async function loadInitialData() {
             try {
-                const resp = await fetch("/radar");
+                const b = map.getBounds();
+                const params = new URLSearchParams({
+                    swLat: b.getSouth().toFixed(4),
+                    swLng: b.getWest().toFixed(4),
+                    neLat: b.getNorth().toFixed(4),
+                    neLng: b.getEast().toFixed(4)
+                });
+                const resp = await fetch(`/radar?${params}`);
                 if (!resp.ok) return;
                 const flights = await resp.json();
                 flights.forEach(f => upsertMarker(f));
@@ -359,6 +385,12 @@
         connection.on("FlightUpdated", (flight) => {
             upsertMarker(flight);
             updateCount++;
+            document.getElementById("aircraft-count").textContent = Object.keys(markers).length;
+        });
+
+        connection.on("FlightBatchUpdated", (flights) => {
+            flights.forEach(f => upsertMarker(f));
+            updateCount += flights.length;
             document.getElementById("aircraft-count").textContent = Object.keys(markers).length;
         });
 
@@ -386,6 +418,9 @@
 
         loadInitialData();
         startConnection();
+
+        // Reload visible flights when user pans or zooms the map
+        map.on('moveend', loadInitialData);
 
         // Poll /radar periodically to reconcile state (catches flights missed by SignalR)
         setInterval(loadInitialData, 30_000);

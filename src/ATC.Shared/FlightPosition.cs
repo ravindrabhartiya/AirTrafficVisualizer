@@ -10,33 +10,33 @@ public sealed class FlightPosition
     [JsonPropertyName("icao24")]
     public string Icao24 { get; set; } = string.Empty;
 
-    [JsonPropertyName("callsign")]
+    [JsonPropertyName("cs")]
     public string Callsign { get; set; } = string.Empty;
 
-    [JsonPropertyName("latitude")]
+    [JsonPropertyName("lat")]
     public double Latitude { get; set; }
 
-    [JsonPropertyName("longitude")]
+    [JsonPropertyName("lon")]
     public double Longitude { get; set; }
 
-    [JsonPropertyName("altitude")]
+    [JsonPropertyName("alt")]
     public double Altitude { get; set; }
 
-    [JsonPropertyName("velocity")]
+    [JsonPropertyName("vel")]
     public double Velocity { get; set; }
 
-    [JsonPropertyName("trueTrack")]
+    [JsonPropertyName("trk")]
     public double TrueTrack { get; set; }
 
-    [JsonPropertyName("onGround")]
+    [JsonPropertyName("gnd")]
     public bool OnGround { get; set; }
 
-    [JsonPropertyName("lastUpdate")]
+    [JsonPropertyName("ts")]
     public long LastUpdate { get; set; }
 
-    [JsonPropertyName("originCountry")]
+    [JsonPropertyName("cty")]
     public string OriginCountry { get; set; } = string.Empty;
 
-    [JsonPropertyName("verticalRate")]
+    [JsonPropertyName("vr")]
     public double VerticalRate { get; set; }
 }
