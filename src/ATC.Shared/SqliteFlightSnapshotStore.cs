@@ -9,6 +9,7 @@ using Microsoft.Data.Sqlite;
 public sealed class SqliteFlightSnapshotStore : IFlightSnapshotStore, IDisposable
 {
     private readonly SqliteConnection _connection;
+    private readonly SemaphoreSlim _lock = new(1, 1);
 
     public SqliteFlightSnapshotStore(string dbPath)
     {
@@ -40,45 +41,55 @@ public sealed class SqliteFlightSnapshotStore : IFlightSnapshotStore, IDisposabl
         cmd.ExecuteNonQuery();
     }
 
-    public Task UpsertAsync(FlightPosition position)
+    public async Task UpsertAsync(FlightPosition position)
     {
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO flight_snapshots
-                (icao24, callsign, latitude, longitude, altitude, velocity,
-                 true_track, vertical_rate, on_ground, origin_country, last_update, updated_at)
-            VALUES
-                ($icao, $cs, $lat, $lon, $alt, $vel, $trk, $vr, $gnd, $country, $upd, datetime('now'))
-            ON CONFLICT(icao24) DO UPDATE SET
-                callsign = excluded.callsign,
-                latitude = excluded.latitude,
-                longitude = excluded.longitude,
-                altitude = excluded.altitude,
-                velocity = excluded.velocity,
-                true_track = excluded.true_track,
-                vertical_rate = excluded.vertical_rate,
-                on_ground = excluded.on_ground,
-                origin_country = excluded.origin_country,
-                last_update = excluded.last_update,
-                updated_at = datetime('now');
-            """;
-        cmd.Parameters.AddWithValue("$icao", position.Icao24);
-        cmd.Parameters.AddWithValue("$cs", position.Callsign);
-        cmd.Parameters.AddWithValue("$lat", position.Latitude);
-        cmd.Parameters.AddWithValue("$lon", position.Longitude);
-        cmd.Parameters.AddWithValue("$alt", position.Altitude);
-        cmd.Parameters.AddWithValue("$vel", position.Velocity);
-        cmd.Parameters.AddWithValue("$trk", position.TrueTrack);
-        cmd.Parameters.AddWithValue("$vr", position.VerticalRate);
-        cmd.Parameters.AddWithValue("$gnd", position.OnGround ? 1 : 0);
-        cmd.Parameters.AddWithValue("$country", position.OriginCountry);
-        cmd.Parameters.AddWithValue("$upd", position.LastUpdate);
-        cmd.ExecuteNonQuery();
-        return Task.CompletedTask;
+        await _lock.WaitAsync();
+        try
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO flight_snapshots
+                    (icao24, callsign, latitude, longitude, altitude, velocity,
+                     true_track, vertical_rate, on_ground, origin_country, last_update, updated_at)
+                VALUES
+                    ($icao, $cs, $lat, $lon, $alt, $vel, $trk, $vr, $gnd, $country, $upd, datetime('now'))
+                ON CONFLICT(icao24) DO UPDATE SET
+                    callsign = excluded.callsign,
+                    latitude = excluded.latitude,
+                    longitude = excluded.longitude,
+                    altitude = excluded.altitude,
+                    velocity = excluded.velocity,
+                    true_track = excluded.true_track,
+                    vertical_rate = excluded.vertical_rate,
+                    on_ground = excluded.on_ground,
+                    origin_country = excluded.origin_country,
+                    last_update = excluded.last_update,
+                    updated_at = datetime('now');
+                """;
+            cmd.Parameters.AddWithValue("$icao", position.Icao24);
+            cmd.Parameters.AddWithValue("$cs", position.Callsign);
+            cmd.Parameters.AddWithValue("$lat", position.Latitude);
+            cmd.Parameters.AddWithValue("$lon", position.Longitude);
+            cmd.Parameters.AddWithValue("$alt", position.Altitude);
+            cmd.Parameters.AddWithValue("$vel", position.Velocity);
+            cmd.Parameters.AddWithValue("$trk", position.TrueTrack);
+            cmd.Parameters.AddWithValue("$vr", position.VerticalRate);
+            cmd.Parameters.AddWithValue("$gnd", position.OnGround ? 1 : 0);
+            cmd.Parameters.AddWithValue("$country", position.OriginCountry);
+            cmd.Parameters.AddWithValue("$upd", position.LastUpdate);
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
-    public Task<IReadOnlyList<FlightPosition>> LoadAllAsync(TimeSpan maxAge)
+    public async Task<IReadOnlyList<FlightPosition>> LoadAllAsync(TimeSpan maxAge)
     {
+        await _lock.WaitAsync();
+        try
+        {
         var cutoff = DateTime.UtcNow - maxAge;
         using var cmd = _connection.CreateCommand();
         cmd.CommandText = """
@@ -109,21 +120,34 @@ public sealed class SqliteFlightSnapshotStore : IFlightSnapshotStore, IDisposabl
             });
         }
 
-        return Task.FromResult<IReadOnlyList<FlightPosition>>(flights);
+        return (IReadOnlyList<FlightPosition>)flights;
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
-    public Task PurgeStaleAsync(TimeSpan maxAge)
+    public async Task PurgeStaleAsync(TimeSpan maxAge)
     {
-        var cutoff = DateTime.UtcNow - maxAge;
-        using var cmd = _connection.CreateCommand();
-        cmd.CommandText = "DELETE FROM flight_snapshots WHERE updated_at < $cutoff;";
-        cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("yyyy-MM-dd HH:mm:ss"));
-        cmd.ExecuteNonQuery();
-        return Task.CompletedTask;
+        await _lock.WaitAsync();
+        try
+        {
+            var cutoff = DateTime.UtcNow - maxAge;
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = "DELETE FROM flight_snapshots WHERE updated_at < $cutoff;";
+            cmd.Parameters.AddWithValue("$cutoff", cutoff.ToString("yyyy-MM-dd HH:mm:ss"));
+            cmd.ExecuteNonQuery();
+        }
+        finally
+        {
+            _lock.Release();
+        }
     }
 
     public void Dispose()
     {
+        _lock.Dispose();
         _connection.Dispose();
     }
 }

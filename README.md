@@ -1,6 +1,6 @@
-# Air Traffic Control — Real-Time Monitoring & Collision Alert System
+# Air Traffic Control — Real-Time Flight Monitoring System
 
-A distributed real-time system that ingests aircraft telemetry, detects potential mid-air collisions, and renders live aircraft positions on an interactive map.
+A distributed real-time system that ingests aircraft telemetry and renders live aircraft positions on an interactive map.
 
 **Tech Stack**: .NET 8 · Apache Kafka (KRaft) · Redis Stack · SignalR · Leaflet.js
 
@@ -14,7 +14,6 @@ graph LR
     B -->|flight-telemetry| C[Kafka]
     C --> D[Tracking Engine<br>Consumer Group]
     D -->|GEOADD / GEOSEARCH| E[Redis]
-    D -->|Collision Detection| D
     E --> F[Dashboard API<br>ASP.NET Core]
     F -->|SignalR Hub| G[Web Frontend<br>Leaflet Map]
 ```
@@ -59,7 +58,7 @@ cd src/ATC.TrackingEngine
 dotnet run
 ```
 
-This connects to Kafka (consumer group: `tracking-engine`) and Redis, processes telemetry, performs collision detection, and pushes updates via SignalR.
+This connects to Kafka (consumer group: `tracking-engine`) and Redis, processes telemetry, and pushes updates via SignalR.
 
 ### 4. Start the Telemetry Producer (Project A)
 
@@ -89,7 +88,7 @@ Navigate to **[http://localhost:5000](http://localhost:5000)** in your browser. 
 |-------------------------|----------------|---------------------------------------------------------------|
 | `ATC.Shared`            | Class Library  | Shared models (`FlightTelemetry`, `FlightPosition`, constants)|
 | `ATC.TelemetryProducer` | Worker Service | Fetches/generates telemetry → produces to Kafka               |
-| `ATC.TrackingEngine`    | Worker Service | Kafka consumer → Redis geospatial + collision detection       |
+| `ATC.TrackingEngine`    | Worker Service | Kafka consumer → Redis geospatial storage               |
 | `ATC.DashboardApi`      | Web API        | REST endpoint + SignalR hub + static file host                |
 
 ## Configuration
@@ -107,13 +106,6 @@ Each project reads from `appsettings.json`. Key settings:
 
 **Dashboard API**
 - `Redis:ConnectionString` — Redis address
-
-## Collision Detection Logic
-
-For every incoming telemetry message:
-1. The aircraft position is stored in a Redis geo key (`active_flights`) using `GEOADD`
-2. `GEOSEARCH` finds all aircraft within a **5 km** radius
-3. For each nearby aircraft, altitude is compared: if within **±1000 ft**, a `COLLISION WARNING` is logged at `Critical` level
 
 ## Shutting Down
 

@@ -109,18 +109,4 @@ public sealed class ConstantsTests
     {
         Assert.Equal("flight-telemetry", Constants.KafkaTopic);
     }
-
-    [Fact]
-    public void CollisionRadius_IsReasonable()
-    {
-        Assert.True(Constants.CollisionRadiusKm > 0);
-        Assert.True(Constants.CollisionRadiusKm <= 50);
-    }
-
-    [Fact]
-    public void AltitudeThreshold_IsReasonable()
-    {
-        Assert.True(Constants.AltitudeThresholdFeet > 0);
-        Assert.True(Constants.AltitudeThresholdFeet <= 5000);
-    }
 }

@@ -2,6 +2,7 @@ namespace ATC.TrackingEngine;
 
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Threading.Channels;
 using ATC.Shared;
 using Confluent.Kafka;
 using Microsoft.AspNetCore.SignalR.Client;
@@ -20,6 +21,18 @@ public sealed class Worker : BackgroundService
     /// <summary>Queue of flight updates waiting to be flushed to SignalR.</summary>
     private readonly ConcurrentQueue<FlightPosition> _signalRQueue = new();
 
+    /// <summary>
+    /// Bounded channel that decouples SQLite writes from the consumer hot path.
+    /// Consumers fire-and-forget into this channel; a background loop drains it.
+    /// DropOldest ensures consumers never block even if SQLite can't keep up.
+    /// </summary>
+    private readonly Channel<FlightPosition> _sqliteChannel =
+        Channel.CreateBounded<FlightPosition>(new BoundedChannelOptions(10_000)
+        {
+            FullMode = BoundedChannelFullMode.DropOldest,
+            SingleReader = true
+        });
+
     /// <summary>Max age of a telemetry message before it is discarded.</summary>
     private static readonly TimeSpan StaleThreshold = TimeSpan.FromMinutes(2);
 
@@ -28,6 +41,9 @@ public sealed class Worker : BackgroundService
 
     /// <summary>Max items sent in a single SignalR batch message.</summary>
     internal const int MaxBatchSize = 200;
+
+    /// <summary>Max items written to SQLite per batch.</summary>
+    internal const int SqliteBatchSize = 500;
 
     public Worker(
         ConsumerConfig consumerConfig,
@@ -58,19 +74,20 @@ public sealed class Worker : BackgroundService
 
         await ConnectToSignalRAsync(hubConnection, stoppingToken);
 
-        // Run stale geo-entry cleanup, SignalR batch flush, and parallel Kafka consumers
+        // Run stale geo-entry cleanup, SignalR batch flush, SQLite drain, and parallel Kafka consumers
         var cleanupTask = CleanupStaleGeoEntriesAsync(stoppingToken);
         var flushTask = FlushSignalRBatchesAsync(hubConnection, stoppingToken);
+        var sqliteDrainTask = DrainSqliteAsync(stoppingToken);
 
         var consumeTasks = new Task[ConsumerCount];
         for (int i = 0; i < ConsumerCount; i++)
         {
             var id = i;
-            consumeTasks[i] = Task.Run(() => ConsumeLoop(hubConnection, id, stoppingToken), stoppingToken);
+            consumeTasks[i] = ConsumeLoopAsync(id, stoppingToken);
         }
         _logger.LogInformation("Launched {Count} parallel Kafka consumers", ConsumerCount);
 
-        await Task.WhenAll(consumeTasks.Append(cleanupTask).Append(flushTask));
+        await Task.WhenAll(consumeTasks.Append(cleanupTask).Append(flushTask).Append(sqliteDrainTask));
     }
 
     private async Task WarmRedisCacheAsync()
@@ -198,74 +215,135 @@ public sealed class Worker : BackgroundService
 
                     if (batch.Count > 0)
                     {
-                        await hub.InvokeAsync("BroadcastFlightBatch", batch, ct);
+                        await hub.SendAsync("BroadcastFlightBatch", batch, ct);
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "SignalR batch flush failed");
+                _logger.LogWarning(ex, "SignalR batch flush failed ({Count} items in queue)", _signalRQueue.Count);
             }
 
             await Task.Delay(500, ct);
         }
     }
 
-    private void ConsumeLoop(HubConnection hubConnection, int consumerId, CancellationToken ct)
+    /// <summary>
+    /// Background loop that drains the SQLite channel and batches upserts.
+    /// Runs independently from consumers so SQLite I/O never slows down
+    /// Kafka consumption or Redis writes.
+    /// </summary>
+    private async Task DrainSqliteAsync(CancellationToken ct)
     {
-        using var consumer = new ConsumerBuilder<string, string>(_consumerConfig).Build();
-        consumer.Subscribe(Constants.KafkaTopic);
+        var reader = _sqliteChannel.Reader;
+        _logger.LogInformation("SQLite background drain started (batch size {BatchSize})", SqliteBatchSize);
 
-        _logger.LogInformation("Consumer-{Id} started, subscribed to {Topic}", consumerId, Constants.KafkaTopic);
-
-        var db = _redis.GetDatabase();
-        var processor = new FlightProcessor(db, _snapshotStore, _loggerFactory.CreateLogger<FlightProcessor>());
-        var nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        long skipped = 0;
-
-        try
+        while (!ct.IsCancellationRequested)
         {
-            while (!ct.IsCancellationRequested)
+            try
             {
-                var result = consumer.Consume(ct);
-                if (result?.Message?.Value is null) continue;
+                // Wait for at least one item (avoids busy-spinning)
+                await reader.WaitToReadAsync(ct);
 
-                try
+                var batch = new List<FlightPosition>(SqliteBatchSize);
+                while (batch.Count < SqliteBatchSize && reader.TryRead(out var pos))
+                    batch.Add(pos);
+
+                // De-duplicate: keep only the latest update per icao24
+                var deduped = batch
+                    .GroupBy(f => f.Icao24)
+                    .Select(g => g.Last())
+                    .ToList();
+
+                foreach (var pos in deduped)
                 {
-                    var flight = JsonSerializer.Deserialize<FlightTelemetry>(result.Message.Value);
-                    if (flight is null || flight.Latitude is null || flight.Longitude is null) continue;
-
-                    // Discard stale messages aggressively
-                    var ageSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - flight.LastUpdate;
-                    if (ageSeconds > StaleThreshold.TotalSeconds)
-                    {
-                        skipped++;
-                        if (skipped % 10_000 == 0)
-                            _logger.LogInformation("Consumer-{Id}: skipped {Count} stale messages (age > {Sec}s)",
-                                consumerId, skipped, (int)StaleThreshold.TotalSeconds);
-                        continue;
-                    }
-
-                    _lastConsumeUtc = DateTime.UtcNow;
-                    var (position, _) = processor.ProcessAsync(flight).GetAwaiter().GetResult();
-
-                    // Enqueue for batched SignalR delivery (non-blocking)
-                    _signalRQueue.Enqueue(position);
-                }
-                catch (JsonException ex)
-                {
-                    _logger.LogWarning(ex, "Consumer-{Id}: deserialization failed", consumerId);
+                    try { await _snapshotStore.UpsertAsync(pos); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "SQLite upsert failed for {Icao}", pos.Icao24); }
                 }
             }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "SQLite drain loop error");
+                await Task.Delay(1000, ct);
+            }
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+
+        _logger.LogInformation("SQLite background drain stopped");
+    }
+
+    /// <summary>
+    /// Runs a dedicated Kafka consumer. The blocking <c>Consume()</c> call is
+    /// offloaded to a thread-pool thread so that the subsequent async Redis
+    /// processing (<see cref="FlightProcessor.ProcessAsync"/>) is properly
+    /// awaited instead of blocked with <c>.GetAwaiter().GetResult()</c>,
+    /// preventing thread-pool starvation under sustained load.
+    /// </summary>
+    private async Task ConsumeLoopAsync(int consumerId, CancellationToken ct)
+    {
+        // Offload the blocking Kafka consumer to a dedicated thread so the
+        // async Redis work that follows can be awaited without blocking.
+        await Task.Run(async () =>
         {
-            // Graceful shutdown
-        }
-        finally
-        {
-            consumer.Close();
-            _logger.LogInformation("Consumer-{Id} stopped (skipped {Skipped} stale messages total)", consumerId, skipped);
-        }
+            using var consumer = new ConsumerBuilder<string, string>(_consumerConfig).Build();
+            consumer.Subscribe(Constants.KafkaTopic);
+
+            _logger.LogInformation("Consumer-{Id} started, subscribed to {Topic}", consumerId, Constants.KafkaTopic);
+
+            var db = _redis.GetDatabase();
+            var processor = new FlightProcessor(db, _loggerFactory.CreateLogger<FlightProcessor>());
+            long skipped = 0;
+
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    var result = consumer.Consume(ct);
+                    if (result?.Message?.Value is null) continue;
+
+                    try
+                    {
+                        var flight = JsonSerializer.Deserialize<FlightTelemetry>(result.Message.Value);
+                        if (flight is null || flight.Latitude is null || flight.Longitude is null) continue;
+
+                        // Discard stale messages aggressively
+                        var ageSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - flight.LastUpdate;
+                        if (ageSeconds > StaleThreshold.TotalSeconds)
+                        {
+                            skipped++;
+                            if (skipped % 10_000 == 0)
+                                _logger.LogInformation("Consumer-{Id}: skipped {Count} stale messages (age > {Sec}s)",
+                                    consumerId, skipped, (int)StaleThreshold.TotalSeconds);
+                            continue;
+                        }
+
+                        _lastConsumeUtc = DateTime.UtcNow;
+                        var position = await processor.ProcessAsync(flight);
+
+                        // Enqueue for batched SignalR delivery (non-blocking)
+                        _signalRQueue.Enqueue(position);
+
+                        // Enqueue for async SQLite persistence (non-blocking, drop-oldest if full)
+                        _sqliteChannel.Writer.TryWrite(position);
+                    }
+                    catch (JsonException ex)
+                    {
+                        _logger.LogWarning(ex, "Consumer-{Id}: deserialization failed", consumerId);
+                    }
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // Graceful shutdown
+            }
+            finally
+            {
+                consumer.Close();
+                _logger.LogInformation("Consumer-{Id} stopped (skipped {Skipped} stale messages total)", consumerId, skipped);
+            }
+        }, ct);
     }
 }

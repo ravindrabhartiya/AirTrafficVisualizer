@@ -18,21 +18,22 @@
    - [ATC.Tests](#atctests)
 6. [Infrastructure](#infrastructure)
 7. [Data Models](#data-models)
-8. [Collision Detection](#collision-detection)
+8. [Performance Optimizations](#performance-optimizations)
 9. [Cold-Start Recovery](#cold-start-recovery)
 10. [Credential Management](#credential-management)
 11. [Rate Limiting](#rate-limiting)
 12. [Frontend Dashboard](#frontend-dashboard)
-13. [Configuration Reference](#configuration-reference)
-14. [Getting Started](#getting-started)
-15. [Testing](#testing)
-16. [Known Limitations](#known-limitations)
+13. [Backend Metrics Dashboard](#backend-metrics-dashboard)
+14. [Configuration Reference](#configuration-reference)
+15. [Getting Started](#getting-started)
+16. [Testing](#testing)
+17. [Known Limitations](#known-limitations)
 
 ---
 
 ## Overview
 
-Air Traffic Control Visualizer is a real-time flight tracking system that ingests live aircraft positions from the [OpenSky Network](https://opensky-network.org/) REST API (or generates mock data), streams them through Apache Kafka, processes them with collision detection, and renders them on an interactive Leaflet.js map in the browser — all with sub-second update latency via SignalR.
+Air Traffic Control Visualizer is a real-time flight tracking system that ingests live aircraft positions from the [OpenSky Network](https://opensky-network.org/) REST API (or generates mock data), streams them through Apache Kafka, processes them, and renders them on an interactive Leaflet.js map in the browser — all with sub-second update latency via SignalR.
 
 ### Key Capabilities
 
@@ -40,12 +41,17 @@ Air Traffic Control Visualizer is a real-time flight tracking system that ingest
 |---|---|
 | Live flight ingestion | OpenSky Network `/api/states/all` with HTTP Basic Auth |
 | Mock mode | 200 simulated flights over the continental US |
-| Stream processing | Apache Kafka with compacted topic |
-| Spatial queries | Redis Geo commands for proximity / collision detection |
-| Real-time push | ASP.NET Core SignalR WebSocket hub |
-| Persistence | SQLite snapshot store for cold-start recovery |
-| Collision warnings | Proximity + altitude threshold alerting |
-| Route lookup | Per-callsign route lookup via OpenSky `/api/routes`, cached in Redis |
+| Stream processing | Apache Kafka with compacted topic, 3 parallel consumers |
+| Spatial queries | Redis Geo commands for viewport filtering and spatial lookups |
+| Real-time push | ASP.NET Core SignalR WebSocket hub with batched broadcasting |
+| Persistence | SQLite snapshot store with async background drain (decoupled from consumers) |
+| Route lookup | Per-callsign route lookup via adsbdb.com, cached in Redis |
+| Aircraft info | Per-ICAO24 registration/type/owner lookup via hexdb.io |
+| Viewport filtering | Bbox-scoped `/radar` queries via Redis `GEOSEARCH BYBOX` |
+| Response compression | Brotli + Gzip middleware for all JSON responses |
+| Compact wire format | Short JSON property names reduce payload ~28% per flight |
+| Oceanic extrapolation | Client-side dead-reckoning for flights without live updates |
+| Backend metrics | Real-time Kafka / Redis / SQLite monitoring dashboard |
 
 ### Tech Stack
 
@@ -54,7 +60,7 @@ Air Traffic Control Visualizer is a real-time flight tracking system that ingest
 - **Redis Stack** — geo operations + hash storage + RedisInsight UI
 - **SQLite** — `Microsoft.Data.Sqlite` for lightweight persistence
 - **SignalR** — real-time WebSocket push to browser clients
-- **Leaflet.js** — interactive map with OpenStreetMap tiles
+- **Leaflet.js** — interactive map with CARTO Voyager tiles (English labels)
 - **xUnit + Moq** — unit tests
 - **Docker Compose** — infrastructure orchestration
 
@@ -88,10 +94,9 @@ graph TD
     KF --> TE
     TE -->|GEOADD + HSET| RD
     TE -->|SQLite persistence| TE
-    TE -->|Collision detection| TE
-    TE -->|SignalR invoke| DA
-    DA <-->|SignalR + /radar + /route + /aircraft| BR
-    DA -->|GEOSEARCH fallback| RD
+    TE -->|SignalR SendAsync<br>batches of 200| DA
+    DA <-->|SignalR + /radar + /route + /aircraft + /api/metrics| BR
+    DA -->|GEOSEARCH BYBOX<br>pipelined hashes| RD
 ```
 
 ---
@@ -100,18 +105,20 @@ graph TD
 
 1. **Ingest** — `TelemetryProducer` polls OpenSky every 10 s (authenticated) or 22 s (anonymous). Each response contains ~5,000–12,000 global aircraft states. Flights with null lat/lon are discarded. Each valid flight is serialized as JSON and produced to Kafka topic `flight-telemetry`, keyed by ICAO24 transponder address.
 
-2. **Process** — `TrackingEngine` consumes from Kafka. For each message:
+2. **Process** — `TrackingEngine` runs 3 parallel Kafka consumers. For each message:
+   - **Staleness filter** — messages older than 2 minutes are discarded aggressively.
    - Stores the position in a Redis **geo sorted set** (`active_flights`) for spatial queries.
    - Stores all flight metadata in a Redis **hash** (`flight:{icao24}`) with a 5-minute TTL.
-   - Runs **collision detection** against nearby aircraft within 5 km and 1,000 ft altitude.
-   - Persists to **SQLite** (`flight_snapshots` table) via UPSERT.
-   - Invokes the SignalR hub method `BroadcastFlightUpdate` on `DashboardApi`.
+   - **Enqueues** to a `ConcurrentQueue` for batched SignalR delivery.
+   - **Enqueues** to a bounded `Channel<FlightPosition>` for async SQLite persistence (non-blocking, drop-oldest if full).
 
-3. **Serve** — `DashboardApi` receives the SignalR invocation and broadcasts the `FlightUpdated` event to all connected browser clients.
+3. **Batch flush** — Every 500 ms, a dedicated flush task drains up to 200 items from the queue and sends them as a single `BroadcastFlightBatch` message via `hub.SendAsync()` (fire-and-forget). This replaces per-message `InvokeAsync` to avoid consumer stalls.
 
-4. **Render** — The browser's Leaflet map updates the marker position in real time. Every 30 seconds the browser also polls `GET /radar` as a reconciliation fallback.
+4. **Serve** — `DashboardApi` broadcasts the `FlightBatchUpdated` event to all connected browser clients. The `/radar` endpoint supports viewport bbox filtering via `GEOSEARCH BYBOX` and returns results using Redis pipelining (`CreateBatch`) for a single round-trip. Responses are compressed with Brotli/Gzip.
 
-5. **Cleanup** — Every 60 seconds, `TrackingEngine` scans the geo set and removes entries whose hash has expired. It also purges SQLite rows older than 5 minutes.
+5. **Render** — The browser normalizes compact JSON property names, updates Leaflet markers in real time, and extrapolates positions for flights without recent updates. Every 30 seconds the browser polls `GET /radar` with viewport bounds as a reconciliation fallback. Map pan/zoom also triggers a reload.
+
+6. **Cleanup** — Every 60 seconds, `TrackingEngine` scans the geo set and removes entries whose hash has expired. SQLite purge only happens when consumers are actively receiving data (prevents destroying recovery snapshots during stalls).
 
 ---
 
@@ -127,10 +134,11 @@ DESIGN.md                        # This document
 src/
   ATC.Shared/                    # Shared library (models, constants, persistence)
     FlightTelemetry.cs           # Inbound DTO from OpenSky
-    FlightPosition.cs            # Outbound DTO to dashboard / SignalR
+    FlightPosition.cs            # Outbound DTO with compact JSON names
     Constants.cs                 # Kafka topic, Redis keys, thresholds
+    GeoHelpers.cs                # Bbox parsing, flight-from-dict mapping
     IFlightSnapshotStore.cs      # Persistence interface
-    SqliteFlightSnapshotStore.cs # SQLite implementation
+    SqliteFlightSnapshotStore.cs # Thread-safe SQLite implementation
 
   ATC.TelemetryProducer/         # Worker service — data ingestion
     Program.cs                   # DI, Kafka, Redis, HttpClient, rate limiter
@@ -140,23 +148,25 @@ src/
 
   ATC.TrackingEngine/            # Worker service — stream processing
     Program.cs                   # DI, Kafka consumer, Redis, SQLite, SignalR config
-    Worker.cs                    # Kafka consume loop, Redis warm, cleanup
-    FlightProcessor.cs           # Core logic: Redis store, collision detect, persist
+    Worker.cs                    # 3 parallel consumers, batched SignalR, cleanup
+    FlightProcessor.cs           # Core logic: Redis store, persist to SQLite
     SignalRConfig.cs             # Record for SignalR hub URL
 
   ATC.DashboardApi/              # ASP.NET Core web app — dashboard
-    Program.cs                   # DI, Redis, SQLite, CORS, endpoints
-    FlightHub.cs                 # SignalR hub — BroadcastFlightUpdate
-    wwwroot/index.html           # Single-page app (Leaflet + SignalR client)
+    Program.cs                   # DI, Redis, SQLite, CORS, compression, endpoints
+    FlightHub.cs                 # SignalR hub — single + batch broadcast
+    wwwroot/index.html           # Live radar SPA (Leaflet + SignalR client)
+    wwwroot/metrics.html         # Backend metrics monitoring dashboard
 
 tests/
-  ATC.Tests/                     # xUnit test project
+  ATC.Tests/                     # xUnit test project (39 tests)
     SqliteFlightSnapshotStoreTests.cs
     MockFlightGeneratorTests.cs
     SharedModelTests.cs
     RetryAfterHandlerTests.cs
     FlightHubTests.cs
     TrackingEngineTests.cs
+    GeoHelpersTests.cs           # Bbox, flight mapping, compact JSON tests
 ```
 
 ---
@@ -170,10 +180,11 @@ Shared class library referenced by all three services.
 | Type | Purpose |
 |---|---|
 | `FlightTelemetry` | Inbound DTO. Fields are nullable (OpenSky may omit values). JSON property names match OpenSky conventions. |
-| `FlightPosition` | Outbound DTO. Non-nullable. Used by `GET /radar`, SignalR push, and SQLite persistence. |
-| `Constants` | `KafkaTopic = "flight-telemetry"`, `RedisGeoKey = "active_flights"`, `CollisionRadiusKm = 5.0`, `AltitudeThresholdFeet = 1000.0`. |
+| `FlightPosition` | Outbound DTO. Non-nullable. Compact JSON property names (`cs`, `lat`, `lon`, `alt`, `vel`, `trk`, `vr`, `gnd`, `cty`, `ts`) reduce wire size ~28%. Used by `GET /radar`, SignalR push, and SQLite persistence. |
+| `Constants` | `KafkaTopic = "flight-telemetry"`, `RedisGeoKey = "active_flights"`. |
+| `GeoHelpers` | Pure static helpers: `ParseBbox(sw/ne coords)` → `BboxParams` record (center + dimensions with 10% padding) for Redis `GEOSEARCH BYBOX`; `ParseFlightFromDict(icao, dict)` → `FlightPosition` from Redis hash dictionary. |
 | `IFlightSnapshotStore` | Persistence interface: `UpsertAsync`, `LoadAllAsync(maxAge)`, `PurgeStaleAsync(maxAge)`. |
-| `SqliteFlightSnapshotStore` | SQLite implementation. Auto-creates schema on construction. Uses `INSERT … ON CONFLICT … DO UPDATE` for upsert. Implements `IDisposable`. |
+| `SqliteFlightSnapshotStore` | Thread-safe SQLite implementation. Uses `SemaphoreSlim(1,1)` to serialize concurrent access from parallel consumers. Auto-creates schema on construction. `INSERT … ON CONFLICT … DO UPDATE` for upsert. Implements `IDisposable`. |
 
 **NuGet dependencies:** `Microsoft.Data.Sqlite` 8.0.12, `System.Text.Json` 10.0.5
 
@@ -202,52 +213,66 @@ Background worker service that fetches flight data and publishes to Kafka.
 Background worker service that consumes from Kafka, processes flights, and pushes updates to the dashboard.
 
 **Startup flow:**
-1. **Warm Redis from SQLite** — loads flights updated within the last 5 minutes and populates the geo set + hash entries. This gives the dashboard immediate data after a restart.
-2. Connect to SignalR hub on `DashboardApi`.
-3. Launch two parallel tasks:
-   - **Consume loop** — reads Kafka messages, delegates to `FlightProcessor`, sends SignalR updates.
-   - **Cleanup loop** — every 60 s, removes geo entries whose hash has expired and purges stale SQLite rows.
+1. **Warm Redis from SQLite** — loads flights updated within the last 30 minutes and populates the geo set + hash entries. This gives the dashboard immediate data after a restart.
+2. Connect to SignalR hub on `DashboardApi` (with automatic reconnect).
+3. Launch five parallel tasks:
+   - **3 Kafka consumer tasks** — each consumes messages, applies a 2-minute staleness filter, delegates to `FlightProcessor` (Redis only), and enqueues results to a `ConcurrentQueue` (SignalR) and a bounded `Channel` (SQLite).
+   - **SignalR batch flush task** — every 500 ms, drains up to 200 items from the queue and sends via `hub.SendAsync("BroadcastFlightBatch", batch)` (fire-and-forget).
+   - **SQLite background drain task** — reads from the bounded `Channel<FlightPosition>` (capacity 10,000, drop-oldest), de-duplicates by ICAO24, and batches up to 500 upserts. Completely decoupled from the consumer hot path so SQLite I/O never blocks Kafka consumption.
+   - **Cleanup task** — every 60 s, removes geo entries whose hash has expired and purges stale SQLite rows (only when consumers are actively receiving data).
+
+**Key design decisions:**
+- Consumers use `Task.Run(async () => ...)` to offload the blocking `Consume()` call to a thread-pool thread while properly `await`ing async Redis operations (prevents thread-pool starvation).
+- `SendAsync` (fire-and-forget) is used instead of `InvokeAsync` (request-response) for SignalR to prevent consumer stalls when the hub is slow or disconnected.
+- SQLite writes are fully decoupled from the consumer hot path via a bounded `Channel<FlightPosition>` with `DropOldest` semantics — consumers never block on I/O beyond Redis.
+- SQLite purge is guarded by `_lastConsumeUtc` — only runs when data was received within the last 2 minutes, preventing destruction of recovery snapshots during stalls.
 
 **Key classes:**
 
 | Class | Responsibility |
 |---|---|
-| `Worker` | Orchestration: warm cache → connect SignalR → run consume + cleanup. |
-| `FlightProcessor` | Extracted for testability. Handles: Redis geo add, hash set with TTL, collision detection (geo search + altitude check), SQLite upsert. Returns `(FlightPosition, List<CollisionWarning>)`. |
-| `CollisionWarning` | Sealed record: `(Icao1, Icao2, DistanceKm, AltitudeDiffFeet)`. |
+| `Worker` | Orchestration: warm cache → connect SignalR → run consumers + flush + SQLite drain + cleanup. |
+| `FlightProcessor` | Extracted for testability. Handles: Redis geo add, hash set with TTL. Returns `FlightPosition`. Consumer hot path only — no SQLite. |
 | `SignalRConfig` | Sealed record: `(HubUrl)`. |
 
-**NuGet dependencies:** `Confluent.Kafka`, `StackExchange.Redis`, `Microsoft.AspNetCore.SignalR.Client`, `Microsoft.Data.Sqlite`
+**NuGet dependencies:** `Confluent.Kafka` 2.13.2, `StackExchange.Redis`, `Microsoft.AspNetCore.SignalR.Client`, `Microsoft.Data.Sqlite`
 
 ### ATC.DashboardApi
 
 ASP.NET Core web application serving the dashboard UI and acting as the SignalR hub.
 
+**Middleware:**
+- **Response compression** — Brotli + Gzip providers (`EnableForHttps = true`), applied to all JSON responses. Reduces wire size ~70–80%.
+
 **Endpoints:**
 
 | Route | Method | Description |
 |---|---|---|
-| `/flighthub` | WebSocket | SignalR hub. `TrackingEngine` invokes `BroadcastFlightUpdate`; browsers receive `FlightUpdated`. |
-| `/radar` | GET | Returns all currently tracked flights. Reads from Redis geo set → hash lookups. Falls back to SQLite if Redis is empty (cold start). |
-| `/route/{callsign}` | GET | Proxies to OpenSky `/api/routes`, caches result in Redis for 1 hour. Callsign is sanitized to alphanumeric characters only. |
+| `/flighthub` | WebSocket | SignalR hub. `TrackingEngine` invokes `BroadcastFlightBatch`; browsers receive `FlightBatchUpdated`. Legacy `BroadcastFlightUpdate`/`FlightUpdated` retained for backward compatibility. |
+| `/radar` | GET | Returns tracked flights. Accepts optional `swLat`, `swLng`, `neLat`, `neLng` query params for viewport bbox filtering via `GEOSEARCH BYBOX`. Uses Redis pipelining (`CreateBatch`) for a single round-trip. Falls back to SQLite if Redis is empty. |
+| `/route/{callsign}` | GET | Proxies to adsbdb.com for route data (airline, origin/destination airports). Caches hits in Redis for 1 hour, misses for 5 minutes. Callsign sanitized to alphanumeric uppercase. |
+| `/aircraft/{icao24}` | GET | Queries hexdb.io for aircraft registration, type, manufacturer, and owner. Caches hits for 24 hours, misses for 1 hour. ICAO24 sanitized to alphanumeric lowercase. |
+| `/api/metrics` | GET | Comprehensive backend metrics: Redis (active flights, keys, memory, ops/sec, clients, uptime), Kafka (brokers, consumer group state, partition offsets, lag), SQLite (file size, path). |
 | `/` | GET | Serves `wwwroot/index.html` (Leaflet SPA). |
+| `/metrics.html` | GET | Backend metrics monitoring dashboard. |
 
-**CORS:** Configured to allow any origin with credentials (required for SignalR WebSocket).
+**Redis configuration:** `AllowAdmin = true` to enable the `INFO` command used by `/api/metrics`.
 
-**NuGet dependencies:** `StackExchange.Redis`, `Microsoft.Data.Sqlite`
+**NuGet dependencies:** `Confluent.Kafka` 2.8.0, `StackExchange.Redis` 2.12.4, `Microsoft.Data.Sqlite`, `Microsoft.AspNetCore.ResponseCompression`
 
 ### ATC.Tests
 
-xUnit test project with 27 tests across 6 test files.
+xUnit test project with 39 tests across 7 test files.
 
 | Test File | Tests | Coverage |
 |---|---|---|
-| `SqliteFlightSnapshotStoreTests` | 7 | Upsert, load, dedup, max-age filtering, purge, bulk, on-ground |
+| `GeoHelpersTests` | 16 | ParseBbox (null, partial, out-of-range, inverted, valid, equator), ParseFlightFromDict (empty, full, onGround, missing), FlightPosition compact JSON serialization/deserialization |
+| `SharedModelTests` | 8 | FlightTelemetry JSON serialization, nullable fields, property names; FlightPosition round-trip; Constants values |
+| `SqliteFlightSnapshotStoreTests` | 6 | Upsert, load, dedup, max-age filtering, purge, bulk |
 | `MockFlightGeneratorTests` | 7 | Flight count, custom count, coordinate bounds, unique ICAOs, movement, velocity, timestamps |
-| `SharedModelTests` | 10 | FlightTelemetry JSON serialization, nullable fields, property names; FlightPosition round-trip; Constants values |
+| `TrackingEngineTests` | 1 | SignalRConfig construction |
 | `RetryAfterHandlerTests` | 2 | Normal request passthrough, 429 retry behavior |
 | `FlightHubTests` | 1 | Hub instantiation |
-| `TrackingEngineTests` | 2 | CollisionWarning record equality, SignalRConfig construction |
 
 ---
 
@@ -280,7 +305,10 @@ Compaction ensures that only the latest position per ICAO24 key is retained, kee
 |---|---|---|---|
 | `active_flights` | Sorted Set (Geo) | — | Geo-indexed set of all tracked aircraft. Members are ICAO24 addresses with lat/lon. |
 | `flight:{icao24}` | Hash | 5 min | Full flight metadata (callsign, lat, lon, altitude, velocity, heading, vertical rate, on-ground, country, last update). |
-| `route:{callsign}` | String (JSON) | 1 hour | Cached route data from OpenSky routes API. |
+| `route:{callsign}` | String (JSON) | 1 hour | Cached route data from adsbdb.com (airline, origin/destination airports). |
+| `route:miss:{callsign}` | String | 5 min | Negative cache for unknown routes (prevents repeated API hits). |
+| `aircraft:{icao24}` | String (JSON) | 24 hours | Cached aircraft info from hexdb.io (registration, type, manufacturer, owner). |
+| `aircraft:miss:{icao24}` | String | 1 hour | Negative cache for unknown aircraft. |
 | `opensky:last_api_call` | String (epoch) | 1 hour | Unix timestamp of the last OpenSky API call, used for startup cooldown. |
 
 ---
@@ -308,35 +336,69 @@ public sealed class FlightTelemetry
 
 ### FlightPosition (outbound to dashboard)
 
-Same fields as `FlightTelemetry` but with non-nullable numeric types (null values default to 0). This is the DTO stored in SQLite, served by `/radar`, and pushed via SignalR.
+Same fields as `FlightTelemetry` but with non-nullable numeric types (null values default to 0). Uses compact JSON property names to reduce wire payload:
+
+| C# Property | JSON Name | Type |
+|---|---|---|
+| `Icao24` | `icao24` | string |
+| `Callsign` | `cs` | string |
+| `Latitude` | `lat` | double |
+| `Longitude` | `lon` | double |
+| `Altitude` | `alt` | double |
+| `Velocity` | `vel` | double |
+| `TrueTrack` | `trk` | double |
+| `VerticalRate` | `vr` | double |
+| `OnGround` | `gnd` | bool |
+| `OriginCountry` | `cty` | string |
+| `LastUpdate` | `ts` | long |
+
+This DTO is stored in SQLite, served by `/radar`, and pushed via SignalR. The compact names yield ~28% smaller JSON per flight (155 vs 216 bytes).
 
 ---
 
-## Collision Detection
+## Performance Optimizations
 
-The `FlightProcessor` runs collision detection for every incoming flight:
+Six optimizations were implemented to reduce bandwidth and improve responsiveness:
 
-1. **Proximity query** — `GEOSEARCH active_flights FROMLONLAT <lon> <lat> BYRADIUS 5 km COUNT 20`
-2. **Altitude filter** — for each neighbor within 5 km, read its altitude from the Redis hash and check if `|alt_self - alt_neighbor| ≤ 1,000 ft`.
-3. **Warning** — if both conditions are met, log a `CRITICAL` collision warning with both ICAO addresses, distance, and altitude difference.
+### 1. Redis Pipelining
 
-**Thresholds** (defined in `Constants.cs`):
-- Horizontal: 5.0 km
-- Vertical: 1,000 ft
+The `/radar` endpoint uses `db.CreateBatch()` to pipeline all `HGETALL` lookups into a single Redis round-trip, replacing N sequential requests.
 
-Mock data intentionally clusters every 10th flight near the previous one to consistently trigger collision warnings during development.
+### 2. Response Compression
 
----
+Brotli + Gzip middleware is applied to all JSON responses (`EnableForHttps = true`). Reduces wire size ~70–80% for typical `/radar` payloads.
 
-## Cold-Start Recovery
+### 3. Viewport Bbox Filtering
+
+The `/radar` endpoint accepts `swLat`, `swLng`, `neLat`, `neLng` query params. When present, `GeoHelpers.ParseBbox()` converts them to a center point + dimensions (with 10% padding) for Redis `GEOSEARCH BYBOX`. Only flights visible in the browser viewport are returned. For a European viewport, this typically filters out ~84% of global flights.
+
+### 4. SignalR Batching
+
+Instead of one SignalR message per flight, `TrackingEngine` enqueues updates to a `ConcurrentQueue<FlightPosition>` and a dedicated flush task drains up to 200 items every 500 ms into a single `BroadcastFlightBatch` message via `hub.SendAsync()` (fire-and-forget). This reduces per-message overhead and prevents consumer stalls.
+
+### 5. Compact JSON Property Names
+
+`FlightPosition` uses short `[JsonPropertyName]` attributes (`cs`, `lat`, `lon`, `alt`, etc.). The frontend `normalise()` function accepts both compact and legacy property names for backward compatibility.
+
+### 6. Async SQLite Background Drain
+
+SQLite writes are fully decoupled from the Kafka consumer hot path using a bounded `Channel<FlightPosition>` (capacity 10,000, `DropOldest`). Consumers only do Redis writes and channel enqueue (both non-blocking). A dedicated background loop:
+- Drains up to 500 items per batch from the channel.
+- De-duplicates by ICAO24 (keeps latest update) to reduce write amplification.
+- Upserts via thread-safe `SemaphoreSlim(1,1)`-protected `SqliteFlightSnapshotStore`.
+
+This ensures consumers always keep up with producers regardless of SQLite I/O latency.
+
+---\n\n## Cold-Start Recovery
 
 Without persistence, restarting any service results in an empty radar until the first OpenSky response arrives (10–22 seconds) and propagates through Kafka → Redis → SignalR.
 
 **Solution: SQLite snapshot store**
 
-1. `TrackingEngine` persists every processed flight to `flight_snapshots` table via UPSERT.
-2. On startup, `TrackingEngine.WarmRedisCacheAsync()` loads all flights updated within the last 5 minutes from SQLite and populates Redis geo set + hash entries.
+1. `TrackingEngine` persists every processed flight to `flight_snapshots` table asynchronously via a background drain loop (bounded `Channel` → de-duplicate by ICAO24 → batched UPSERT, protected by `SemaphoreSlim`).
+2. On startup, `TrackingEngine.WarmRedisCacheAsync()` loads all flights updated within the last 30 minutes from SQLite and populates Redis geo set + hash entries.
 3. `DashboardApi.GET /radar` falls back to SQLite when the Redis geo set is empty.
+4. SQLite purge is guarded: only runs when consumers are actively receiving data (`_lastConsumeUtc` within last 2 minutes), preventing destruction of recovery snapshots during stalls.
 
 **Result:** The dashboard shows aircraft immediately after a restart, even before Kafka starts producing new data.
 
@@ -395,18 +457,44 @@ Single-page application served from `wwwroot/index.html`.
 
 | Library | Version | Purpose |
 |---|---|---|
-| Leaflet.js | 1.9.4 | Map rendering with OpenStreetMap tiles |
+| Leaflet.js | 1.9.4 | Map rendering with CARTO Voyager tiles (English labels worldwide) |
 | SignalR JS client | 8.0.0 | Real-time WebSocket connection |
 
 ### Features
 
-- **Live aircraft markers** — SVG plane icons rotated to match heading. Color indicates normal (blue) or collision warning (red).
-- **Rich tooltips** — hover to see callsign, ICAO, country, altitude, speed, heading, vertical rate.
-- **Route popup** — click an aircraft to see its route (origin → destination airports), fetched from `/route/{callsign}` and cached.
-- **Status bar** — connection status indicator (green/yellow/red), aircraft count, updates-per-second counter.
-- **Stale marker cleanup** — markers not updated for 5 minutes are removed automatically.
+- **Live aircraft markers** — SVG plane icons rotated to match heading. Color coding: blue (normal), gray/translucent (estimated/oceanic).
+- **Compact JSON normalization** — `normalise()` function maps both compact (`cs`, `lat`, `lon`, ...) and legacy (`callsign`, `latitude`, ...) property names for backward compatibility.
+- **Batched SignalR updates** — handles both `FlightUpdated` (single, legacy) and `FlightBatchUpdated` (array, preferred) events.
+- **Viewport-scoped loading** — `loadInitialData()` sends map bounds as `swLat/swLng/neLat/neLng` query params to `/radar`. Reloads on `map.on('moveend')` when user pans or zooms.
+- **Position extrapolation** — every 5 seconds, airborne flights without a live update for 30+ seconds are projected forward using their last known velocity + heading. Uses great-circle approximation with Mercator cos(lat) correction. Markers appear in gray.
+- **Rich tooltips** — hover to see callsign, ICAO, country, altitude, speed, heading, vertical rate, on-ground status, estimated indicator.
+- **Aircraft info popup** — click an aircraft to fetch registration, type, manufacturer, and operator from `/aircraft/{icao}` (hexdb.io data). Cached client-side.
+- **Route popup** — click an aircraft to see its route (airline name, origin → destination airports with IATA codes and full names) from `/route/{callsign}` (adsbdb.com data). Cached client-side.
+- **Status bar** — connection status indicator (green/yellow/red dot), aircraft count, updates-per-second counter, navigation links (Live Map, Metrics).
+- **Stale marker cleanup** — every 15 seconds: live-tracked markers removed after 5 minutes, estimated/oceanic markers after 30 minutes.
 - **Periodic polling** — `GET /radar` every 30 seconds reconciles state for any flights missed by SignalR.
-- **Auto-reconnect** — SignalR reconnects automatically with exponential backoff (0, 1, 3, 5, 10 seconds).
+- **Auto-reconnect** — SignalR reconnects automatically with backoff (0, 1, 3, 5, 10 seconds).
+
+---
+
+## Backend Metrics Dashboard
+
+Monitoring dashboard served from `wwwroot/metrics.html`, accessible via the "Metrics" link in the status bar.
+
+### Sections
+
+| Section | Metrics |
+|---|---|
+| **Kafka Pipeline** | Broker list (ID, host, port), consumer group state/members/protocol, total messages produced/consumed, consumption progress bar, per-partition offsets + lag |
+| **Redis Cache** | Active flights (geo set size), total keys, memory usage (current + peak), operations/second, connected clients, uptime |
+| **SQLite Persistence** | Database file size (formatted), full file path |
+
+### Features
+
+- Auto-refreshes every 5 seconds with countdown timer.
+- Color-coded lag indicators (green/yellow/red).
+- Error banners on failed metric fetches.
+- Responsive grid layout.
 
 ---
 
@@ -531,14 +619,14 @@ All SQLite tests use in-memory databases (`:memory:` or temp files) and clean up
 
 ## Known Limitations
 
-1. **OpenSky coverage** — OpenSky Network relies on volunteer ADS-B receivers. Coverage is excellent over Europe and North America but sparse over oceans and remote areas. Commercial services like FlightRadar24 have 30,000+ receivers and satellite-based ADS-B, giving them significantly more coverage.
+1. **OpenSky coverage** — OpenSky Network relies on volunteer ADS-B receivers. Coverage is excellent over Europe and North America but sparse over oceans and remote areas. Client-side position extrapolation partially mitigates this for oceanic flights.
 
 2. **Single-node Kafka** — the Docker Compose setup runs a single Kafka broker with no replication. Not suitable for production.
 
 3. **No authentication on the dashboard** — the web interface and API endpoints are unauthenticated. In a production deployment, add authentication middleware.
 
-4. **SQLite concurrency** — SQLite uses file-level locking. With TrackingEngine writing and DashboardApi reading the same database file, this works for a single instance but would need a shared database (e.g., PostgreSQL) for horizontal scaling.
+4. **SQLite concurrency** — SQLite uses file-level locking. A `SemaphoreSlim` serializes concurrent access from parallel consumers, but this limits write throughput. For horizontal scaling, migrate to PostgreSQL or another shared database.
 
-5. **Collision detection is 2.5D** — uses Redis geo (2D) for proximity, then checks altitude difference. It does not predict future positions or account for convergence rates.
+5. **No HTTPS** — local development runs over HTTP. Use a reverse proxy (nginx, Caddy) or configure Kestrel HTTPS for production.
 
-6. **No HTTPS** — local development runs over HTTP. Use a reverse proxy (nginx, Caddy) or configure Kestrel HTTPS for production.
+6. **External API dependencies** — route lookup (adsbdb.com) and aircraft info (hexdb.io) are free community APIs with no SLA. Results are cached aggressively to minimize impact of outages.

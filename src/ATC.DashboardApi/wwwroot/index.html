@@ -84,9 +84,10 @@
         // ─── Map Setup ───────────────────────────────────────────
         const map = L.map("map", { zoomControl: true }).setView([47.6, -122.3], 5);
 
-        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-            maxZoom: 18,
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png", {
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> &copy; <a href="https://carto.com/">CARTO</a>',
+            subdomains: 'abcd'
         }).addTo(map);
 
         // ─── Aircraft Markers ────────────────────────────────────
@@ -112,8 +113,8 @@
             };
         }
 
-        function createPlaneIcon(heading, isWarning, isEstimated) {
-            const color = isWarning ? "#ef4444" : isEstimated ? "#64748b" : "#38bdf8";
+        function createPlaneIcon(heading, isEstimated) {
+            const color = isEstimated ? "#64748b" : "#38bdf8";
             const opacity = isEstimated ? "0.55" : "0.95";
             const svg = `
                 <svg width="28" height="28" viewBox="0 0 28 28" xmlns="http://www.w3.org/2000/svg">
@@ -284,7 +285,7 @@
             const flight = normalise(raw);
             const key = flight.icao24;
             const latlng = [flight.latitude, flight.longitude];
-            const icon = createPlaneIcon(flight.trueTrack || 0, false, isEstimated);
+            const icon = createPlaneIcon(flight.trueTrack || 0, isEstimated);
 
             if (markers[key]) {
                 markers[key].marker.setLatLng(latlng);
@@ -327,7 +328,7 @@
                 f.latitude = Math.max(-85, Math.min(85, newLat));
                 f.longitude = ((newLon + 540) % 360) - 180;
 
-                const icon = createPlaneIcon(f.trueTrack || 0, false, true);
+                const icon = createPlaneIcon(f.trueTrack || 0, true);
                 data.marker.setLatLng([f.latitude, f.longitude]);
                 data.marker.setIcon(icon);
                 data.estimated = true;
