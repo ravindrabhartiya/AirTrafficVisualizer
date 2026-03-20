@@ -11,7 +11,7 @@ public sealed class MockFlightGenerator
     private readonly List<SimulatedFlight> _flights = new();
     private readonly Random _rng = new();
 
-    public MockFlightGenerator(int flightCount = 40)
+    public MockFlightGenerator(int flightCount = 200)
     {
         for (int i = 0; i < flightCount; i++)
         {

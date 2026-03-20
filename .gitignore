@@ -1,0 +1,40 @@
+# Build outputs
+**/bin/
+**/obj/
+**/out/
+
+# .NET User Secrets (should never be committed)
+**/secrets.json
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# NuGet
+**/packages/
+*.nupkg
+project.lock.json
+
+# SQLite databases (local runtime data)
+*.db
+*.db-shm
+*.db-wal
+flights.db
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Credentials files — NEVER commit
+credentials.json
+**/credentials.json
+
+# Rider
+.idea/
+
+# Docker volumes
+redis-data/

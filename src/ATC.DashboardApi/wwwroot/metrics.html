@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ATC — Backend Metrics</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body { height: 100%; font-family: 'Segoe UI', system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+
+        /* ── Navigation ─── */
+        #nav-bar {
+            position: fixed; top: 0; left: 0; right: 0; z-index: 1000;
+            background: rgba(15, 23, 42, 0.95); color: #94a3b8;
+            padding: 8px 16px; font-size: 13px;
+            display: flex; align-items: center; gap: 16px;
+            backdrop-filter: blur(8px); border-bottom: 1px solid #1e293b;
+        }
+        #nav-bar .title { color: #38bdf8; font-weight: 700; font-size: 15px; }
+        #nav-bar a { color: #94a3b8; text-decoration: none; padding: 4px 12px; border-radius: 4px; transition: all 0.2s; }
+        #nav-bar a:hover { color: #e2e8f0; background: #1e293b; }
+        #nav-bar a.active { color: #38bdf8; background: rgba(56, 189, 248, 0.12); }
+        .auto-refresh { margin-left: auto; color: #64748b; font-size: 12px; }
+
+        /* ── Layout ─── */
+        .container { padding: 56px 24px 24px; max-width: 1400px; margin: 0 auto; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .section-title { color: #38bdf8; font-size: 18px; font-weight: 700; margin: 20px 0 12px; }
+
+        /* ── Cards ─── */
+        .card {
+            background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+            padding: 20px; transition: border-color 0.2s;
+        }
+        .card:hover { border-color: #475569; }
+        .card h3 { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
+        .card .value { color: #f1f5f9; font-size: 28px; font-weight: 700; line-height: 1.2; }
+        .card .sub { color: #64748b; font-size: 12px; margin-top: 4px; }
+        .card .value.green { color: #22c55e; }
+        .card .value.red { color: #ef4444; }
+        .card .value.yellow { color: #eab308; }
+        .card .value.blue { color: #38bdf8; }
+
+        /* ── Table ─── */
+        .table-card { grid-column: 1 / -1; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+             padding: 8px 12px; text-align: left; border-bottom: 1px solid #334155; font-weight: 600; }
+        td { padding: 8px 12px; border-bottom: 1px solid #1e293b; color: #e2e8f0; }
+        tr:hover td { background: rgba(56, 189, 248, 0.04); }
+        .lag-ok { color: #22c55e; }
+        .lag-warn { color: #eab308; }
+        .lag-crit { color: #ef4444; }
+
+        /* ── Progress bar ─── */
+        .progress-wrap { background: #0f172a; border-radius: 4px; height: 6px; margin-top: 6px; overflow: hidden; }
+        .progress-bar { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+        .progress-bar.green { background: linear-gradient(90deg, #22c55e, #16a34a); }
+        .progress-bar.blue { background: linear-gradient(90deg, #38bdf8, #0284c7); }
+
+        /* ── Error banner ─── */
+        .error-banner {
+            background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; border-radius: 8px;
+            padding: 12px 16px; color: #fca5a5; font-size: 13px; margin-bottom: 16px; display: none;
+        }
+
+        /* ── Broker badge ─── */
+        .broker-badge {
+            display: inline-block; background: #0f172a; border: 1px solid #334155;
+            border-radius: 6px; padding: 6px 12px; margin: 4px 4px 4px 0; font-size: 12px;
+        }
+        .broker-badge .label { color: #94a3b8; }
+        .broker-badge .addr { color: #38bdf8; font-weight: 600; }
+    </style>
+</head>
+<body>
+    <div id="nav-bar">
+        <span class="title">ATC Radar</span>
+        <a href="/">Live Map</a>
+        <a href="/metrics.html" class="active">Metrics</a>
+        <span class="auto-refresh">Auto-refresh: <span id="countdown">5</span>s</span>
+    </div>
+
+    <div class="container">
+        <div class="error-banner" id="error-banner"></div>
+
+        <!-- ── Kafka Section ─── -->
+        <div class="section-title">&#9652; Kafka Pipeline</div>
+        <div class="grid">
+            <div class="card">
+                <h3>Brokers</h3>
+                <div id="brokers"><span class="value">—</span></div>
+            </div>
+            <div class="card">
+                <h3>Consumer Group State</h3>
+                <div class="value" id="consumer-state">—</div>
+                <div class="sub" id="consumer-detail"></div>
+            </div>
+            <div class="card">
+                <h3>Total Messages Produced</h3>
+                <div class="value blue" id="total-produced">—</div>
+            </div>
+            <div class="card">
+                <h3>Total Messages Consumed</h3>
+                <div class="value green" id="total-consumed">—</div>
+                <div class="progress-wrap"><div class="progress-bar green" id="consumed-progress" style="width: 0%"></div></div>
+                <div class="sub" id="consumed-pct"></div>
+            </div>
+            <div class="card">
+                <h3>Consumer Lag (Total)</h3>
+                <div class="value" id="total-lag">—</div>
+                <div class="sub" id="lag-trend"></div>
+            </div>
+            <div class="card">
+                <h3>Topic Partitions</h3>
+                <div class="value blue" id="partition-count">—</div>
+                <div class="sub" id="topic-detail"></div>
+            </div>
+        </div>
+
+        <!-- Partition table -->
+        <div class="grid">
+            <div class="card table-card">
+                <h3>Partition Offsets &amp; Lag</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Partition</th>
+                            <th>Current Offset</th>
+                            <th>Log End Offset</th>
+                            <th>Lag</th>
+                            <th>Progress</th>
+                        </tr>
+                    </thead>
+                    <tbody id="partition-tbody"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- ── Redis Section ─── -->
+        <div class="section-title">&#9652; Redis Cache</div>
+        <div class="grid">
+            <div class="card">
+                <h3>Active Flights (Geo Set)</h3>
+                <div class="value green" id="redis-flights">—</div>
+            </div>
+            <div class="card">
+                <h3>Total Keys</h3>
+                <div class="value blue" id="redis-keys">—</div>
+            </div>
+            <div class="card">
+                <h3>Memory Usage</h3>
+                <div class="value" id="redis-memory">—</div>
+                <div class="sub" id="redis-memory-peak"></div>
+            </div>
+            <div class="card">
+                <h3>Ops / Second</h3>
+                <div class="value blue" id="redis-ops">—</div>
+            </div>
+            <div class="card">
+                <h3>Connected Clients</h3>
+                <div class="value" id="redis-clients">—</div>
+            </div>
+            <div class="card">
+                <h3>Uptime</h3>
+                <div class="value" id="redis-uptime">—</div>
+            </div>
+        </div>
+
+        <!-- ── SQLite Section ─── -->
+        <div class="section-title">&#9652; SQLite Persistence</div>
+        <div class="grid">
+            <div class="card">
+                <h3>Database Size</h3>
+                <div class="value" id="sqlite-size">—</div>
+                <div class="sub" id="sqlite-path"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    (function() {
+        const REFRESH_INTERVAL = 5_000;
+        let prevLag = null;
+        let countdownVal = 5;
+
+        function fmt(n) {
+            if (n === undefined || n === null) return '—';
+            return Number(n).toLocaleString();
+        }
+
+        function fmtBytes(bytes) {
+            if (!bytes) return '—';
+            const units = ['B', 'KB', 'MB', 'GB'];
+            let i = 0;
+            let v = Number(bytes);
+            while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+            return v.toFixed(1) + ' ' + units[i];
+        }
+
+        function fmtUptime(seconds) {
+            const s = Number(seconds);
+            if (isNaN(s)) return '—';
+            const d = Math.floor(s / 86400);
+            const h = Math.floor((s % 86400) / 3600);
+            const m = Math.floor((s % 3600) / 60);
+            return d > 0 ? `${d}d ${h}h ${m}m` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+        }
+
+        function lagClass(lag) {
+            if (lag < 1000) return 'lag-ok';
+            if (lag < 50000) return 'lag-warn';
+            return 'lag-crit';
+        }
+
+        function stateColor(state) {
+            if (!state) return '';
+            const s = state.toLowerCase();
+            if (s === 'stable') return 'green';
+            if (s === 'preparingrebalance' || s === 'completingrebalance') return 'yellow';
+            return 'red';
+        }
+
+        async function fetchMetrics() {
+            const banner = document.getElementById('error-banner');
+            try {
+                const resp = await fetch('/api/metrics');
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                banner.style.display = 'none';
+                render(data);
+            } catch (err) {
+                banner.textContent = `Failed to fetch metrics: ${err.message}`;
+                banner.style.display = 'block';
+            }
+        }
+
+        function render(data) {
+            // ── Kafka ──
+            const k = data.kafka;
+            if (k && !k.error) {
+                // Brokers
+                const brokersEl = document.getElementById('brokers');
+                if (k.brokers && k.brokers.length > 0) {
+                    brokersEl.innerHTML = k.brokers.map(b =>
+                        `<span class="broker-badge"><span class="label">ID ${b.id}</span> <span class="addr">${b.host}:${b.port}</span></span>`
+                    ).join('');
+                } else {
+                    brokersEl.innerHTML = '<span class="value red">No brokers</span>';
+                }
+
+                // Consumer
+                const stateEl = document.getElementById('consumer-state');
+                const detailEl = document.getElementById('consumer-detail');
+                if (k.consumer) {
+                    stateEl.textContent = k.consumer.state || 'Unknown';
+                    stateEl.className = 'value ' + stateColor(k.consumer.state);
+                    detailEl.textContent = `Group: ${k.consumer.groupId} · Members: ${k.consumer.members} · Protocol: ${k.consumer.protocol}`;
+                } else {
+                    stateEl.textContent = 'No Consumer';
+                    stateEl.className = 'value red';
+                    detailEl.textContent = 'tracking-engine group not found';
+                }
+
+                // Totals
+                document.getElementById('total-produced').textContent = fmt(k.totalMessages);
+                document.getElementById('total-consumed').textContent = fmt(k.totalConsumed);
+
+                const pct = k.totalMessages > 0 ? ((k.totalConsumed / k.totalMessages) * 100) : 0;
+                document.getElementById('consumed-progress').style.width = pct.toFixed(1) + '%';
+                document.getElementById('consumed-pct').textContent = pct.toFixed(1) + '% of produced';
+
+                // Lag
+                const lagEl = document.getElementById('total-lag');
+                lagEl.textContent = fmt(k.totalLag);
+                lagEl.className = 'value ' + lagClass(k.totalLag);
+
+                const trendEl = document.getElementById('lag-trend');
+                if (prevLag !== null) {
+                    const diff = k.totalLag - prevLag;
+                    if (diff < 0) trendEl.textContent = `▼ ${fmt(Math.abs(diff))} since last check (catching up)`;
+                    else if (diff > 0) trendEl.textContent = `▲ ${fmt(diff)} since last check (falling behind)`;
+                    else trendEl.textContent = '— steady';
+                    trendEl.style.color = diff < 0 ? '#22c55e' : diff > 0 ? '#ef4444' : '#64748b';
+                }
+                prevLag = k.totalLag;
+
+                // Topic
+                if (k.topic) {
+                    document.getElementById('partition-count').textContent = k.topic.partitions;
+                    document.getElementById('topic-detail').textContent =
+                        `Topic: ${k.topic.name} · Replication: ${k.topic.replicationFactor}`;
+                }
+
+                // Partition table
+                const tbody = document.getElementById('partition-tbody');
+                tbody.innerHTML = '';
+                if (k.partitions) {
+                    k.partitions.forEach(p => {
+                        const pPct = p.logEndOffset > 0 ? ((p.currentOffset / p.logEndOffset) * 100) : 0;
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td><strong>P${p.partition}</strong></td>
+                            <td>${fmt(p.currentOffset)}</td>
+                            <td>${fmt(p.logEndOffset)}</td>
+                            <td class="${lagClass(p.lag)}">${fmt(p.lag)}</td>
+                            <td>
+                                <div class="progress-wrap" style="width:120px; display:inline-block; vertical-align:middle;">
+                                    <div class="progress-bar blue" style="width:${pPct.toFixed(1)}%"></div>
+                                </div>
+                                <span style="color:#64748b; font-size:11px; margin-left:6px;">${pPct.toFixed(1)}%</span>
+                            </td>`;
+                        tbody.appendChild(tr);
+                    });
+                }
+            } else if (k && k.error) {
+                document.getElementById('consumer-state').textContent = 'Error';
+                document.getElementById('consumer-state').className = 'value red';
+                document.getElementById('consumer-detail').textContent = k.error;
+            }
+
+            // ── Redis ──
+            const r = data.redis;
+            if (r && !r.error) {
+                document.getElementById('redis-flights').textContent = fmt(r.activeFlights);
+                document.getElementById('redis-keys').textContent = fmt(r.totalKeys);
+                document.getElementById('redis-memory').textContent = r.usedMemory || '—';
+                document.getElementById('redis-memory-peak').textContent = r.usedMemoryPeak ? `Peak: ${r.usedMemoryPeak}` : '';
+                document.getElementById('redis-ops').textContent = fmt(r.opsPerSec);
+                document.getElementById('redis-clients').textContent = fmt(r.connectedClients);
+                document.getElementById('redis-uptime').textContent = fmtUptime(r.uptimeSeconds);
+            } else if (r && r.error) {
+                document.getElementById('redis-flights').textContent = 'Error';
+                document.getElementById('redis-flights').className = 'value red';
+            }
+
+            // ── SQLite ──
+            const s = data.sqlite;
+            if (s && !s.error) {
+                document.getElementById('sqlite-size').textContent = fmtBytes(s.dbSizeBytes);
+                document.getElementById('sqlite-path').textContent = s.dbPath || '';
+            }
+        }
+
+        // Initial + interval
+        fetchMetrics();
+        setInterval(fetchMetrics, REFRESH_INTERVAL);
+
+        // Countdown display
+        setInterval(() => {
+            countdownVal--;
+            if (countdownVal <= 0) countdownVal = 5;
+            document.getElementById('countdown').textContent = countdownVal;
+        }, 1000);
+    })();
+    </script>
+</body>
+</html>

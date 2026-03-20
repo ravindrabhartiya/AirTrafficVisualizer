@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="Moq" Version="4.20.72" />
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.12" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ATC.Shared\ATC.Shared.csproj" />
+    <ProjectReference Include="..\..\src\ATC.TelemetryProducer\ATC.TelemetryProducer.csproj" />
+    <ProjectReference Include="..\..\src\ATC.TrackingEngine\ATC.TrackingEngine.csproj" />
+    <ProjectReference Include="..\..\src\ATC.DashboardApi\ATC.DashboardApi.csproj" />
+  </ItemGroup>
+
+</Project>

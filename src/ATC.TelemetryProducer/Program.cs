@@ -23,11 +23,18 @@ builder.Services.AddSingleton<IProducer<string, string>>(sp =>
 var redisConnection = builder.Configuration.GetValue("Redis:ConnectionString", "localhost:6379")!;
 builder.Services.AddSingleton<IConnectionMultiplexer>(ConnectionMultiplexer.Connect(redisConnection));
 
-// --- Rate limiter: 1 token per 22 s ≈ 3927 requests/day (under the 4000 limit) ---
+// --- OpenSky credentials (from User Secrets / env vars) ---
+var openSkyClientId = builder.Configuration.GetValue<string>("OpenSky:ClientId");
+var openSkyClientSecret = builder.Configuration.GetValue<string>("OpenSky:ClientSecret");
+
+// --- Rate limiter: authenticated users get ~4000 req/day, anonymous ~400 ---
+var hasCredentials = !string.IsNullOrEmpty(openSkyClientId) && !string.IsNullOrEmpty(openSkyClientSecret);
+var replenishSeconds = hasCredentials ? 10 : 22;
+
 builder.Services.AddSingleton(new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
 {
     TokenLimit = 1,
-    ReplenishmentPeriod = TimeSpan.FromSeconds(22),
+    ReplenishmentPeriod = TimeSpan.FromSeconds(replenishSeconds),
     TokensPerPeriod = 1,
     QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
     QueueLimit = 1,
@@ -41,6 +48,15 @@ builder.Services.AddHttpClient("OpenSky", client =>
 {
     client.BaseAddress = new Uri("https://opensky-network.org");
     client.Timeout = TimeSpan.FromSeconds(30);
+
+    // Add Basic Auth if credentials are configured (via User Secrets / env vars)
+    if (!string.IsNullOrEmpty(openSkyClientId) && !string.IsNullOrEmpty(openSkyClientSecret))
+    {
+        var credentials = Convert.ToBase64String(
+            System.Text.Encoding.ASCII.GetBytes($"{openSkyClientId}:{openSkyClientSecret}"));
+        client.DefaultRequestHeaders.Authorization =
+            new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", credentials);
+    }
 }).AddHttpMessageHandler<RetryAfterHandler>();
 
 builder.Services.AddHostedService<Worker>();

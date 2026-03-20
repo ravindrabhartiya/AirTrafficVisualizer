@@ -1,5 +1,6 @@
 namespace ATC.TrackingEngine;
 
+using System.Collections.Concurrent;
 using System.Text.Json;
 using ATC.Shared;
 using Confluent.Kafka;
@@ -10,23 +11,39 @@ public sealed class Worker : BackgroundService
 {
     private readonly ConsumerConfig _consumerConfig;
     private readonly IConnectionMultiplexer _redis;
+    private readonly IFlightSnapshotStore _snapshotStore;
     private readonly SignalRConfig _signalRConfig;
+    private readonly ILoggerFactory _loggerFactory;
     private readonly ILogger<Worker> _logger;
+    private DateTime _lastConsumeUtc = DateTime.MinValue;
+
+    /// <summary>Max age of a telemetry message before it is discarded.</summary>
+    private static readonly TimeSpan StaleThreshold = TimeSpan.FromMinutes(2);
+
+    /// <summary>Number of parallel consumer threads (one per Kafka partition max).</summary>
+    private const int ConsumerCount = 3;
 
     public Worker(
         ConsumerConfig consumerConfig,
         IConnectionMultiplexer redis,
+        IFlightSnapshotStore snapshotStore,
         SignalRConfig signalRConfig,
+        ILoggerFactory loggerFactory,
         ILogger<Worker> logger)
     {
         _consumerConfig = consumerConfig;
         _redis = redis;
+        _snapshotStore = snapshotStore;
         _signalRConfig = signalRConfig;
+        _loggerFactory = loggerFactory;
         _logger = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Warm Redis from SQLite snapshot so dashboard has data immediately
+        await WarmRedisCacheAsync();
+
         // Build SignalR connection with retry
         var hubConnection = new HubConnectionBuilder()
             .WithUrl(_signalRConfig.HubUrl)
@@ -35,8 +52,107 @@ public sealed class Worker : BackgroundService
 
         await ConnectToSignalRAsync(hubConnection, stoppingToken);
 
-        // Run Kafka consumer on a background thread (Consume is blocking)
-        await Task.Run(() => ConsumeLoop(hubConnection, stoppingToken), stoppingToken);
+        // Run stale geo-entry cleanup and parallel Kafka consumers
+        var cleanupTask = CleanupStaleGeoEntriesAsync(stoppingToken);
+
+        var consumeTasks = new Task[ConsumerCount];
+        for (int i = 0; i < ConsumerCount; i++)
+        {
+            var id = i;
+            consumeTasks[i] = Task.Run(() => ConsumeLoop(hubConnection, id, stoppingToken), stoppingToken);
+        }
+        _logger.LogInformation("Launched {Count} parallel Kafka consumers", ConsumerCount);
+
+        await Task.WhenAll(consumeTasks.Append(cleanupTask));
+    }
+
+    private async Task WarmRedisCacheAsync()
+    {
+        try
+        {
+            var flights = await _snapshotStore.LoadAllAsync(TimeSpan.FromMinutes(30));
+            if (flights.Count == 0)
+            {
+                _logger.LogInformation("No SQLite snapshot data to warm Redis with");
+                return;
+            }
+
+            var db = _redis.GetDatabase();
+            foreach (var f in flights)
+            {
+                await db.GeoAddAsync(Constants.RedisGeoKey, f.Longitude, f.Latitude, f.Icao24);
+                var hashKey = $"flight:{f.Icao24}";
+                var entries = new HashEntry[]
+                {
+                    new("callsign", f.Callsign),
+                    new("latitude", f.Latitude.ToString("F6")),
+                    new("longitude", f.Longitude.ToString("F6")),
+                    new("altitude", f.Altitude.ToString("F1")),
+                    new("velocity", f.Velocity.ToString("F1")),
+                    new("trueTrack", f.TrueTrack.ToString("F1")),
+                    new("verticalRate", f.VerticalRate.ToString("F1")),
+                    new("onGround", f.OnGround ? "1" : "0"),
+                    new("originCountry", f.OriginCountry),
+                    new("lastUpdate", f.LastUpdate.ToString())
+                };
+                await db.HashSetAsync(hashKey, entries);
+                await db.KeyExpireAsync(hashKey, TimeSpan.FromMinutes(5));
+            }
+
+            _logger.LogInformation("Warmed Redis with {Count} flights from SQLite snapshot", flights.Count);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to warm Redis from SQLite — starting cold");
+        }
+    }
+
+    /// <summary>
+    /// Periodically removes entries from the Redis geo set whose flight hash has expired,
+    /// preventing phantom aircraft on the dashboard.
+    /// </summary>
+    private async Task CleanupStaleGeoEntriesAsync(CancellationToken ct)
+    {
+        var db = _redis.GetDatabase();
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var members = await db.SortedSetRangeByRankAsync(Constants.RedisGeoKey);
+                int removed = 0;
+                foreach (var member in members)
+                {
+                    var icao = member.ToString();
+                    if (!await db.KeyExistsAsync($"flight:{icao}"))
+                    {
+                        await db.SortedSetRemoveAsync(Constants.RedisGeoKey, member);
+                        removed++;
+                    }
+                }
+                if (removed > 0)
+                    _logger.LogInformation("Cleaned up {Count} stale geo entries", removed);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Error during geo cleanup");
+            }
+
+            // Only purge SQLite if the consumer is actively receiving data,
+            // otherwise we'd destroy the recovery snapshot during stalls.
+            if (_lastConsumeUtc > DateTime.UtcNow.AddMinutes(-2))
+            {
+                try
+                {
+                    await _snapshotStore.PurgeStaleAsync(TimeSpan.FromHours(1));
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Error during SQLite purge");
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(60), ct);
+        }
     }
 
     private async Task ConnectToSignalRAsync(HubConnection hub, CancellationToken ct)
@@ -57,14 +173,17 @@ public sealed class Worker : BackgroundService
         }
     }
 
-    private void ConsumeLoop(HubConnection hubConnection, CancellationToken ct)
+    private void ConsumeLoop(HubConnection hubConnection, int consumerId, CancellationToken ct)
     {
         using var consumer = new ConsumerBuilder<string, string>(_consumerConfig).Build();
         consumer.Subscribe(Constants.KafkaTopic);
 
-        _logger.LogInformation("Tracking Engine consumer started, subscribed to {Topic}", Constants.KafkaTopic);
+        _logger.LogInformation("Consumer-{Id} started, subscribed to {Topic}", consumerId, Constants.KafkaTopic);
 
         var db = _redis.GetDatabase();
+        var processor = new FlightProcessor(db, _snapshotStore, _loggerFactory.CreateLogger<FlightProcessor>());
+        var nowEpoch = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        long skipped = 0;
 
         try
         {
@@ -78,11 +197,36 @@ public sealed class Worker : BackgroundService
                     var flight = JsonSerializer.Deserialize<FlightTelemetry>(result.Message.Value);
                     if (flight is null || flight.Latitude is null || flight.Longitude is null) continue;
 
-                    ProcessFlight(db, flight, hubConnection).GetAwaiter().GetResult();
+                    // Discard stale messages aggressively
+                    var ageSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds() - flight.LastUpdate;
+                    if (ageSeconds > StaleThreshold.TotalSeconds)
+                    {
+                        skipped++;
+                        if (skipped % 10_000 == 0)
+                            _logger.LogInformation("Consumer-{Id}: skipped {Count} stale messages (age > {Sec}s)",
+                                consumerId, skipped, (int)StaleThreshold.TotalSeconds);
+                        continue;
+                    }
+
+                    _lastConsumeUtc = DateTime.UtcNow;
+                    var (position, _) = processor.ProcessAsync(flight).GetAwaiter().GetResult();
+
+                    // Push update to SignalR hub
+                    if (hubConnection.State == HubConnectionState.Connected)
+                    {
+                        try
+                        {
+                            hubConnection.InvokeAsync("BroadcastFlightUpdate", position, ct).GetAwaiter().GetResult();
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Consumer-{Id}: SignalR send failed for {Icao}", consumerId, flight.Icao24);
+                        }
+                    }
                 }
                 catch (JsonException ex)
                 {
-                    _logger.LogWarning(ex, "Failed to deserialize flight message");
+                    _logger.LogWarning(ex, "Consumer-{Id}: deserialization failed", consumerId);
                 }
             }
         }
@@ -93,94 +237,7 @@ public sealed class Worker : BackgroundService
         finally
         {
             consumer.Close();
-            _logger.LogInformation("Tracking Engine consumer stopped");
-        }
-    }
-
-    private async Task ProcessFlight(IDatabase db, FlightTelemetry flight, HubConnection hub)
-    {
-        double lat = flight.Latitude!.Value;
-        double lon = flight.Longitude!.Value;
-        double alt = flight.BaroAltitude ?? 0;
-
-        // Store position in Redis geo key
-        await db.GeoAddAsync(Constants.RedisGeoKey, lon, lat, flight.Icao24);
-
-        // Store metadata as a hash
-        var hashKey = $"flight:{flight.Icao24}";
-        var entries = new HashEntry[]
-        {
-            new("callsign",      flight.Callsign),
-            new("latitude",      lat.ToString("F6")),
-            new("longitude",     lon.ToString("F6")),
-            new("altitude",      alt.ToString("F1")),
-            new("velocity",      (flight.Velocity ?? 0).ToString("F1")),
-            new("trueTrack",     (flight.TrueTrack ?? 0).ToString("F1")),
-            new("verticalRate",  (flight.VerticalRate ?? 0).ToString("F1")),
-            new("onGround",      flight.OnGround ? "1" : "0"),
-            new("originCountry", flight.OriginCountry),
-            new("lastUpdate",    flight.LastUpdate.ToString())
-        };
-        await db.HashSetAsync(hashKey, entries);
-        await db.KeyExpireAsync(hashKey, TimeSpan.FromMinutes(5));
-
-        // Collision detection: GEOSEARCH for nearby aircraft
-        var nearby = await db.GeoSearchAsync(
-            Constants.RedisGeoKey,
-            lon, lat,
-            new GeoSearchCircle(Constants.CollisionRadiusKm, GeoUnit.Kilometers),
-            count: 20);
-
-        if (nearby.Length > 1)
-        {
-            foreach (var neighbor in nearby)
-            {
-                var neighborId = neighbor.Member.ToString();
-                if (neighborId == flight.Icao24) continue;
-
-                // Check altitude proximity
-                var neighborHash = await db.HashGetAsync($"flight:{neighborId}", "altitude");
-                if (neighborHash.HasValue && double.TryParse(neighborHash, out double neighborAlt))
-                {
-                    double altDiff = Math.Abs(alt - neighborAlt);
-                    if (altDiff <= Constants.AltitudeThresholdFeet)
-                    {
-                        double distKm = neighbor.Distance ?? 0;
-                        _logger.LogCritical(
-                            "⚠️  COLLISION WARNING: {Icao1} ({Call1}) and {Icao2} at {Alt1:F0}ft - " +
-                            "distance {Dist:F2}km, altitude diff {AltDiff:F0}ft",
-                            flight.Icao24, flight.Callsign, neighborId, alt, distKm, altDiff);
-                    }
-                }
-            }
-        }
-
-        // Push update to SignalR hub
-        if (hub.State == HubConnectionState.Connected)
-        {
-            var position = new FlightPosition
-            {
-                Icao24 = flight.Icao24,
-                Callsign = flight.Callsign,
-                Latitude = lat,
-                Longitude = lon,
-                Altitude = alt,
-                Velocity = flight.Velocity ?? 0,
-                TrueTrack = flight.TrueTrack ?? 0,
-                VerticalRate = flight.VerticalRate ?? 0,
-                OnGround = flight.OnGround,
-                OriginCountry = flight.OriginCountry,
-                LastUpdate = flight.LastUpdate
-            };
-
-            try
-            {
-                await hub.InvokeAsync("BroadcastFlightUpdate", position);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Failed to send SignalR update for {Icao}", flight.Icao24);
-            }
+            _logger.LogInformation("Consumer-{Id} stopped (skipped {Skipped} stale messages total)", consumerId, skipped);
         }
     }
 }

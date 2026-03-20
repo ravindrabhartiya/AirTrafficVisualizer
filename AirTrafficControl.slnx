@@ -5,4 +5,7 @@
     <Project Path="src/ATC.TelemetryProducer/ATC.TelemetryProducer.csproj" />
     <Project Path="src/ATC.TrackingEngine/ATC.TrackingEngine.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ATC.Tests/ATC.Tests.csproj" />
+  </Folder>
 </Solution>

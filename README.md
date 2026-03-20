@@ -8,19 +8,15 @@ A distributed real-time system that ingests aircraft telemetry, detects potentia
 
 ## Architecture
 
-```
-┌──────────────────┐     Kafka      ┌─────────────────────┐     Redis      ┌──────────────────┐
-│  Telemetry       │  ──────────►   │  Tracking &         │  ──────────►   │  Dashboard API   │
-│  Producer        │   flight-      │  Analytics Engine    │   GEOADD /     │  (ASP.NET Core)  │
-│  (Worker Svc)    │   telemetry    │  (Consumer Group)    │   GEOSEARCH    │                  │
-└──────────────────┘                └─────────────────────┘                └────────┬─────────┘
-       │                                     │                                     │
-  OpenSky API                          Collision                             SignalR Hub
-  or Mock Data                         Detection                                   │
-                                                                           ┌───────▼────────┐
-                                                                           │  Web Frontend   │
-                                                                           │  (Leaflet Map)  │
-                                                                           └────────────────┘
+```mermaid
+graph LR
+    A[OpenSky API / Mock Data] -->|HTTP GET| B[Telemetry Producer<br>Worker Service]
+    B -->|flight-telemetry| C[Kafka]
+    C --> D[Tracking Engine<br>Consumer Group]
+    D -->|GEOADD / GEOSEARCH| E[Redis]
+    D -->|Collision Detection| D
+    E --> F[Dashboard API<br>ASP.NET Core]
+    F -->|SignalR Hub| G[Web Frontend<br>Leaflet Map]
 ```
 
 ## Prerequisites
